@@ -30,8 +30,6 @@ use std::io::{Read, Write};
 #[cfg(feature = "std")]
 use byteorder::ReadBytesExt;
 
-use heapless::Vec;
-
 #[cfg(feature = "std")]
 mod connection;
 #[cfg(feature = "std")]
@@ -44,15 +42,15 @@ use utils::remove_trailing_zeroes;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::{bytes::Bytes, error::ParserError};
+use bytes::{Buf, BufMut};
+
+use crate::error::ParserError;
 
 use crc_any::CRCu16;
 
 // include generate definitions
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
-pub mod bytes;
-pub mod bytes_mut;
 pub mod error;
 
 #[cfg(feature = "embedded")]
@@ -60,27 +58,105 @@ mod embedded;
 #[cfg(feature = "embedded")]
 use embedded::{Read, Write};
 
+/*
+pub struct BytesMut<B> {
+    buf: B,
+}
+
+impl<B: BufMut> BytesMut<B> {
+    fn new(buf: B) -> Self {
+        Bytesn { buf }
+    }
+
+    fn reserve_slice<'a>(&'a mut self, n: usize) -> Option<InitSlice<'a, B>> {
+        use std::{ptr, slice};
+
+        unsafe {
+            // SAFETY: We are not reading or writing uninitialized bytes
+            let uninit = self.buf.chunk_mut().as_mut_ptr();
+            ptr::write_bytes(uninit, 0, n);
+        }
+    }
+}
+
+pub struct InitSlice<'a, B: BufMut> {
+    bytes_mut: &'a mut BytesMut<B>,
+    n: usize,
+}
+
+impl<'a, B: BufMut> Deref for InitSlice<'a, B> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe {
+            // SAFETY: 
+            let uninit = self.bytes_mut.buf.chunk_mut().as_mut_ptr() as *const _;
+            slice::from_raw_parts::<'a, u8>(uninit as *const u8, n)
+        }
+    }
+}
+
+impl<'a, B: BufMut> DerefMut for InitSlice<'a, B> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            let uninit = self.bytes_mut.buf.chunk_mut().as_mut_ptr();
+            slice::from_raw_parts::<'a, u8>(uninit as *mut u8, n)
+        }
+    }
+}
+
+impl<'a, B: BufMut> Drop for InitSlice<'a, B> {
+    fn drop(&mut self) {
+        let n = self.n;
+        unsafe { self.bytes_mut.buf.advance_mut(n); }
+    }
+}
+
+impl<B: BufMut> BufMut for BytesMut<B> {
+    fn remaining_mut(&self) -> usize {
+        self.buf.remaining_mut()
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.buf.advance_mut(cnt)
+    }
+
+    fn chunk_mut(&mut self) -> bytes::UnintSlice {
+        self.buf.chunk_mut()
+    }
+}
+*/
+
 pub const MAX_FRAME_SIZE: usize = 280;
 
-pub trait Message
-where
-    Self: Sized,
-{
-    fn message_id(&self) -> u32;
-    fn message_name(&self) -> &'static str;
+pub struct MessageMeta<M: Message> {
+    pub id: u32,
+    pub name: &'static str,
+    pub extra_crc: u8,
+    pub serialized_len: u8,
+    pub default: M,
+}
+
+pub trait MessageInstance<M: Message>: Default {
+    fn meta() -> &'static MessageMeta<M>;
+
+    fn serialize_payload(&self, version: MavlinkVersion, payload: &mut [u8]) -> usize;
+    fn deserialize_payload(version: MavlinkVersion, payload: &[u8]) -> Result<Self, ParserError>;
+}
+
+pub trait Message: Sized + 'static {
+    fn meta(&self) -> &'static MessageMeta<Self>;
+    fn meta_from_id(id: u32) -> Option<&'static MessageMeta<Self>>;
+    fn meta_from_name(name: &str) -> Option<&'static MessageMeta<Self>>;
 
     /// Serialize **Message** into byte slice and return count of bytes written
-    fn ser(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize;
+    fn serialize(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize;
 
-    fn parse(
+    fn deserialize(
         version: MavlinkVersion,
         msgid: u32,
         payload: &[u8],
     ) -> Result<Self, error::ParserError>;
-
-    fn message_id_from_name(name: &str) -> Result<u32, &'static str>;
-    fn default_message_from_id(id: u32) -> Result<Self, &'static str>;
-    fn extra_crc(id: u32) -> u8;
 }
 
 /// Metadata from a MAVLink packet header
@@ -140,37 +216,44 @@ impl<M: Message> MavFrame<M> {
     //    }
 
     /// Serialize MavFrame into a vector, so it can be sent over a socket, for example.
-    pub fn ser(&self) -> Vec<u8, MAX_FRAME_SIZE> {
-        // serialize header
-        let mut v = Vec::from_slice(&[
-            self.header.system_id,
-            self.header.component_id,
-            self.header.sequence,
-        ])
-        .unwrap();
+    pub fn serialize<B: BufMut>(&self, mut buf: B) -> Result<(), error::NotEnoughBytes> {
+        let header_size = if self.protocol_version == MavlinkVersion::V1 {
+            MAVLinkV1MessageRaw::HEADER_SIZE
+        } else {
+            MAVLinkV2MessageRaw::HEADER_SIZE
+        };
+        let serialized_len = self.msg.meta().serialized_len;
+        // Assumes no signature
+        let msg_size = header_size + serialized_len as usize + 2;
+        if buf.remaining_mut() < msg_size {
+            return Err(error::NotEnoughBytes);
+        }
 
-        // message id
+        // Serialize header
+        buf.put_u8(self.header.system_id);
+        buf.put_u8(self.header.component_id);
+        buf.put_u8(self.header.sequence);
+
+        // Message ID
         match self.protocol_version {
             MavlinkVersion::V2 => {
-                let bytes: [u8; 4] = self.msg.message_id().to_le_bytes();
-                v.extend_from_slice(&bytes).unwrap();
+                let bytes: [u8; 4] = self.msg.meta().id.to_le_bytes();
+                buf.put(&bytes[..3]);
             }
-            MavlinkVersion::V1 => {
-                v.push(self.msg.message_id() as u8).unwrap(); //TODO check
-            }
+            MavlinkVersion::V1 => buf.put_u8(self.msg.meta().id as u8),
         }
-        // serialize message
+        // Serialize message
         let mut payload_buf = [0u8; 255];
-        let payload_len = self.msg.ser(self.protocol_version, &mut payload_buf);
+        let payload_len = self.msg.serialize(self.protocol_version, &mut payload_buf);
+        debug_assert_eq!(payload_len, serialized_len as usize);
 
-        v.extend_from_slice(&payload_buf[..payload_len]).unwrap();
-
-        v
+        buf.put(&payload_buf[..payload_len]);
+        Ok(())
     }
 
     /// Deserialize MavFrame from a slice that has been received from, for example, a socket.
-    pub fn deser(version: MavlinkVersion, input: &[u8]) -> Result<Self, ParserError> {
-        let mut buf = Bytes::new(input);
+    pub fn deserialize(version: MavlinkVersion, input: &[u8]) -> Result<Self, ParserError> {
+        let mut buf = input;
 
         let system_id = buf.get_u8();
         let component_id = buf.get_u8();
@@ -186,7 +269,7 @@ impl<M: Message> MavFrame<M> {
             MavlinkVersion::V1 => buf.get_u8().into(),
         };
 
-        match M::parse(version, msg_id, buf.remaining_bytes()) {
+        match M::deserialize(version, msg_id, buf) {
             Ok(msg) => Ok(Self {
                 header,
                 msg,
@@ -289,7 +372,7 @@ impl MAVLinkV1MessageRaw {
         let payload_length: usize = self.payload_length().into();
         let mut crc_calculator = CRCu16::crc16mcrf4cc();
         crc_calculator.digest(&self.0[1..(1 + Self::HEADER_SIZE + payload_length)]);
-        let extra_crc = M::extra_crc(self.message_id().into());
+        let extra_crc = M::meta_from_id(self.message_id() as u32).unwrap().extra_crc;
 
         crc_calculator.digest(&[extra_crc]);
         crc_calculator.get_crc()
@@ -302,10 +385,10 @@ impl MAVLinkV1MessageRaw {
 
     pub fn serialize_message<M: Message>(&mut self, header: MavHeader, message: &M) {
         self.0[0] = MAV_STX;
-        let msgid = message.message_id();
+        let msgid = message.meta().id;
 
         let payload_buf = &mut self.0[(1 + Self::HEADER_SIZE)..(1 + Self::HEADER_SIZE + 255)];
-        let payload_len = message.ser(MavlinkVersion::V1, payload_buf);
+        let payload_len = message.serialize(MavlinkVersion::V1, payload_buf);
 
         let header_buf = self.mut_header();
         header_buf.copy_from_slice(&[
@@ -353,7 +436,7 @@ pub fn read_v1_msg<M: Message, R: Read>(
             continue;
         }
 
-        return M::parse(
+        return M::deserialize(
             MavlinkVersion::V1,
             u32::from(message.message_id()),
             message.payload(),
@@ -471,7 +554,7 @@ impl MAVLinkV2MessageRaw {
         let mut crc_calculator = CRCu16::crc16mcrf4cc();
         crc_calculator.digest(&self.0[1..(1 + Self::HEADER_SIZE + payload_length)]);
 
-        let extra_crc = M::extra_crc(self.message_id());
+        let extra_crc = M::meta_from_id(self.message_id()).unwrap().extra_crc;
         crc_calculator.digest(&[extra_crc]);
         crc_calculator.get_crc()
     }
@@ -483,11 +566,11 @@ impl MAVLinkV2MessageRaw {
 
     pub fn serialize_message<M: Message>(&mut self, header: MavHeader, message: &M) {
         self.0[0] = MAV_STX_V2;
-        let msgid = message.message_id();
+        let msgid = message.meta().id;
         let msgid_bytes = msgid.to_le_bytes();
 
         let payload_buf = &mut self.0[(1 + Self::HEADER_SIZE)..(1 + Self::HEADER_SIZE + 255)];
-        let payload_len = message.ser(MavlinkVersion::V2, payload_buf);
+        let payload_len = message.serialize(MavlinkVersion::V2, payload_buf);
 
         let header_buf = self.mut_header();
         header_buf.copy_from_slice(&[
@@ -540,7 +623,7 @@ pub fn read_v2_msg<M: Message, R: Read>(
             continue;
         }
 
-        return M::parse(MavlinkVersion::V2, message.message_id(), message.payload())
+        return M::deserialize(MavlinkVersion::V2, message.message_id(), message.payload())
             .map(|msg| {
                 (
                     MavHeader {

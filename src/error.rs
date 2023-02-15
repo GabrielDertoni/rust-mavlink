@@ -2,11 +2,14 @@ use core::fmt::{Display, Formatter};
 #[cfg(feature = "std")]
 use std::error::Error;
 
+pub struct NotEnoughSpace;
+
 #[derive(Debug)]
 pub enum ParserError {
     InvalidFlag { flag_type: &'static str, value: u32 },
     InvalidEnum { enum_type: &'static str, value: u32 },
     UnknownMessage { id: u32 },
+    NotEnougBytes,
 }
 
 impl Display for ParserError {
@@ -20,7 +23,8 @@ impl Display for ParserError {
                 f,
                 "Invalid enum value for enum type {enum_type:?}, got {value:?}"
             ),
-            Self::UnknownMessage { id } => write!(f, "Unknown message with ID {id:?}"),
+            Self::UnknownMessage { id } => write!(f, "Unknown message with ID {:?}", id),
+            Self::NotEnougBytes => write!(f, "Not enough bytes to parse message"),
         }
     }
 }
@@ -93,3 +97,6 @@ impl From<std::io::Error> for MessageWriteError {
         Self::Io(e)
     }
 }
+
+#[derive(Debug)]
+pub struct NotEnoughBytes;

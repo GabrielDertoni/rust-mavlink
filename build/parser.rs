@@ -12,12 +12,12 @@ use std::u32;
 use quick_xml::{events::Event, Reader};
 
 use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MavProfile {
     pub messages: HashMap<String, MavMessage>,
@@ -27,13 +27,7 @@ pub struct MavProfile {
 impl MavProfile {
     fn add_message(&mut self, message: &MavMessage) {
         match self.messages.entry(message.name.clone()) {
-            Entry::Occupied(entry) => {
-                assert!(
-                    entry.get() == message,
-                    "Message '{}' defined twice but definitions are different",
-                    message.name
-                );
-            }
+            Entry::Occupied(_) => panic!("Message '{}' defined twice", message.name),
             Entry::Vacant(entry) => {
                 entry.insert(message.clone());
             }
@@ -54,27 +48,17 @@ impl MavProfile {
     /// Go over all fields in the messages, and if you encounter an enum,
     /// update this enum with information about whether it is a bitmask, and what
     /// is the desired width of such.
-    fn update_enums(mut self) -> Self {
-        for msg in self.messages.values() {
-            for field in &msg.fields {
-                if let Some(ref enum_name) = field.enumtype {
-                    // it is an enum
-                    if let Some(ref dsp) = field.display {
-                        // it is a bitmask
-                        if dsp == "bitmask" {
-                            // find the corresponding enum
-                            for mut enm in self.enums.values_mut() {
-                                if enm.name == *enum_name {
-                                    // this is the right enum
-                                    enm.bitfield = Some(field.mavtype.rust_type());
-                                }
-                            }
-                        }
-                    }
-                }
+    fn update_enums(&mut self) {
+        let Self { messages, enums } = self;
+        let it = messages.values()
+            .flat_map(|msg| &msg.fields)
+            .filter(|field| field.display.as_deref() == Some("bitmask"))
+            .filter_map(|field| field.enumtype.as_ref().map(|enum_name| (enum_name, &field.mavtype)));
+        for (enum_name, mavtype) in it {
+            for enm in enums.values_mut().filter(|enm| enm.name == *enum_name) {
+                enm.bitfield = Some(mavtype.rust_type());
             }
         }
-        self
     }
 
     //TODO verify this is no longer necessary since we're supporting both mavlink1 and mavlink2
@@ -103,13 +87,10 @@ impl MavProfile {
     }
 
     /// Get list of original message names
-    fn emit_enum_names(&self) -> Vec<TokenStream> {
+    fn emit_variant_names(&self) -> Vec<TokenStream> {
         self.messages
             .values()
-            .map(|msg| {
-                let name = format_ident!("{}", msg.name);
-                quote!(#name)
-            })
+            .map(|msg| format_ident!("{}", msg.name).into_token_stream())
             .collect()
     }
 
@@ -118,6 +99,13 @@ impl MavProfile {
         self.messages
             .values()
             .map(|msg| msg.emit_struct_name())
+            .collect()
+    }
+
+    fn emit_struct_meta_names(&self) -> Vec<TokenStream> {
+        self.messages
+            .values()
+            .map(|msg| msg.emit_struct_meta_name())
             .collect()
     }
 
@@ -132,56 +120,35 @@ impl MavProfile {
             .collect()
     }
 
-    /// CRC values needed for mavlink parsing
-    fn emit_msg_crc(&self) -> Vec<TokenStream> {
-        self.messages
-            .values()
-            .map(|msg| {
-                let ec = extra_crc(msg);
-                quote!(#ec)
-            })
-            .collect()
-    }
-
     fn emit_rust(&self) -> TokenStream {
-        //TODO verify that id_width of u8 is OK even in mavlink v1
-        let id_width = format_ident!("u32");
-
         let comment = self.emit_comments();
         let msgs = self.emit_msgs();
-        let enum_names = self.emit_enum_names();
+        let variant_names = self.emit_variant_names();
         let struct_names = self.emit_struct_names();
+        let struct_meta_names = self.emit_struct_meta_names();
         let enums = self.emit_enums();
         let msg_ids = self.emit_msg_ids();
-        let msg_crc = self.emit_msg_crc();
 
-        let mav_message = self.emit_mav_message(&enum_names, &struct_names);
-        let mav_message_parse = self.emit_mav_message_parse(&enum_names, &struct_names, &msg_ids);
-        let mav_message_crc = self.emit_mav_message_crc(&id_width, &msg_ids, &msg_crc);
-        let mav_message_name = self.emit_mav_message_name(&enum_names);
-        let mav_message_id = self.emit_mav_message_id(&enum_names, &msg_ids);
-        let mav_message_id_from_name = self.emit_mav_message_id_from_name(&enum_names, &msg_ids);
-        let mav_message_default_from_id =
-            self.emit_mav_message_default_from_id(&enum_names, &msg_ids);
-        let mav_message_serialize = self.emit_mav_message_serialize(&enum_names);
+        let mav_message = self.emit_mav_message(&variant_names, &struct_names);
+        let fn_meta = self.emit_fn_meta(&variant_names, &struct_meta_names);
+        let fn_meta_from_id = self.emit_fn_meta_from_id(&struct_meta_names, &msg_ids);
+        let fn_meta_from_name = self.emit_fn_meta_from_name(&struct_meta_names, &variant_names);
+        let mav_message_serialize = self.emit_mav_message_serialize(&variant_names);
+        let mav_message_deserialize = self.emit_mav_message_parse(&variant_names, &struct_names, &msg_ids);
 
         quote! {
             #comment
-            use crate::MavlinkVersion;
+
             #[allow(unused_imports)]
-            use num_derive::FromPrimitive;
+            use num_derive::{FromPrimitive, ToPrimitive};
             #[allow(unused_imports)]
-            use num_traits::FromPrimitive;
-            #[allow(unused_imports)]
-            use num_derive::ToPrimitive;
-            #[allow(unused_imports)]
-            use num_traits::ToPrimitive;
+            use num_traits::{FromPrimitive, ToPrimitive};
             #[allow(unused_imports)]
             use bitflags::bitflags;
             #[allow(unused_imports)]
-            use heapless::Vec;
+            use bytes::{Buf, BufMut};
 
-            use crate::{Message, error::*, bytes::Bytes, bytes_mut::BytesMut};
+            use crate::{Message, MessageInstance, MavlinkVersion, MessageMeta, error::*};
 
             #[cfg(feature = "serde")]
             use serde::{Serialize, Deserialize};
@@ -194,13 +161,11 @@ impl MavProfile {
             #mav_message
 
             impl Message for MavMessage {
-                #mav_message_parse
-                #mav_message_name
-                #mav_message_id
-                #mav_message_id_from_name
-                #mav_message_default_from_id
+                #fn_meta
+                #fn_meta_from_id
+                #fn_meta_from_name
                 #mav_message_serialize
-                #mav_message_crc
+                #mav_message_deserialize
             }
         }
     }
@@ -219,6 +184,29 @@ impl MavProfile {
         }
     }
 
+    fn emit_fn_meta(
+        &self,
+        enum_variants: &[TokenStream],
+        struct_meta_names: &[TokenStream],
+    ) -> TokenStream {
+        let arms = enum_variants
+            .iter()
+            .zip(struct_meta_names)
+            .map(|(variant, struct_meta_name)| {
+                quote!(#variant(_) => &#struct_meta_name)
+            });
+
+        quote! {
+            fn meta(&self) -> &'static MessageMeta<Self> {
+                use MavMessage::*;
+
+                match self {
+                    #(#arms,)*
+                }
+            }
+        }
+    }
+
     fn emit_mav_message_parse(
         &self,
         enums: &[TokenStream],
@@ -228,9 +216,9 @@ impl MavProfile {
         let id_width = format_ident!("u32");
 
         quote! {
-            fn parse(version: MavlinkVersion, id: #id_width, payload: &[u8]) -> Result<Self, ParserError> {
+            fn deserialize(version: MavlinkVersion, id: #id_width, payload: &[u8]) -> Result<MavMessage, ParserError> {
                 match id {
-                    #(#ids => #structs::deser(version, payload).map(Self::#enums),)*
+                    #(#ids => #structs::deserialize_payload(version, payload).map(MavMessage::#enums),)*
                     _ => {
                         Err(ParserError::UnknownMessage { id })
                     },
@@ -239,89 +227,33 @@ impl MavProfile {
         }
     }
 
-    fn emit_mav_message_crc(
+    fn emit_fn_meta_from_id(
         &self,
-        id_width: &Ident,
+        struct_meta_names: &[TokenStream],
         ids: &[TokenStream],
-        crc: &[TokenStream],
     ) -> TokenStream {
         quote! {
-            fn extra_crc(id: #id_width) -> u8 {
+            fn meta_from_id(id: u32) -> Option<&'static MessageMeta<Self>> {
                 match id {
-                    #(#ids => #crc,)*
-                    _ => {
-                        0
-                    },
+                    #(#ids => Some(&#struct_meta_names),)*
+                    _ => None,
                 }
             }
         }
     }
 
-    fn emit_mav_message_name(&self, enums: &Vec<TokenStream>) -> TokenStream {
-        let enum_names = enums.iter().map(|enum_name| {
-            let name = enum_name.to_string();
-            quote!(#name)
-        });
-
-        quote! {
-            fn message_name(&self) -> &'static str {
-                match self {
-                    #(Self::#enums(..) => #enum_names,)*
-                }
-            }
-        }
-    }
-
-    fn emit_mav_message_id(&self, enums: &Vec<TokenStream>, ids: &Vec<TokenStream>) -> TokenStream {
-        let id_width = format_ident!("u32");
-        quote! {
-            fn message_id(&self) -> #id_width {
-                match self {
-                    #(Self::#enums(..) => #ids,)*
-                }
-            }
-        }
-    }
-
-    fn emit_mav_message_id_from_name(
+    fn emit_fn_meta_from_name(
         &self,
-        enums: &[TokenStream],
-        ids: &[TokenStream],
+        struct_meta_names: &[TokenStream],
+        message_names: &[TokenStream]
     ) -> TokenStream {
-        let enum_names = enums.iter().map(|enum_name| {
-            let name = enum_name.to_string();
-            quote!(#name)
-        });
-
+        let message_names_str = message_names.iter()
+            .map(|name| name.to_string().into_token_stream());
         quote! {
-            fn message_id_from_name(name: &str) -> Result<u32, &'static str> {
+            fn meta_from_name(name: &str) -> Option<&'static MessageMeta<Self>> {
                 match name {
-                    #(#enum_names => Ok(#ids),)*
-                    _ => {
-                        Err("Invalid message name.")
-                    }
-                }
-            }
-        }
-    }
-
-    fn emit_mav_message_default_from_id(
-        &self,
-        enums: &[TokenStream],
-        ids: &[TokenStream],
-    ) -> TokenStream {
-        let data_name = enums.iter().map(|enum_name| {
-            let name = format_ident!("{}_DATA", enum_name.to_string());
-            quote!(#name)
-        });
-
-        quote! {
-            fn default_message_from_id(id: u32) -> Result<Self, &'static str> {
-                match id {
-                    #(#ids => Ok(Self::#enums(#data_name::default())),)*
-                    _ => {
-                        Err("Invalid message id.")
-                    }
+                    #(#message_names_str => Some(&#struct_meta_names),)*
+                    _ => None,
                 }
             }
         }
@@ -329,22 +261,25 @@ impl MavProfile {
 
     fn emit_mav_message_serialize(&self, enums: &Vec<TokenStream>) -> TokenStream {
         quote! {
-            fn ser(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize {
-                match self {
-                    #(Self::#enums(body) => body.ser(version, bytes),)*
+            fn serialize(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize {
+                match *self {
+                    #(MavMessage::#enums(ref body) => body.serialize_payload(version, bytes),)*
                 }
             }
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MavEnum {
     pub name: String,
     pub description: Option<String>,
     pub entries: Vec<MavEnumEntry>,
-    /// If contains Some, the string represents the type witdh for bitflags
+    pub is_bitmask: bool,
+    /// If contains Some, the string represents the type witdh for bitflags. This field starts off
+    /// as `None` even when `is_bitmask = true` and will be set when we can figure out where this
+    /// bitmask is used which will define it's type.
     pub bitfield: Option<String>,
 }
 
@@ -406,18 +341,22 @@ impl MavEnum {
     }
 
     fn emit_name(&self) -> TokenStream {
-        let name = format_ident!("{}", self.name);
-        quote!(#name)
+        format_ident!("{}", self.name).into_token_stream()
+    }
+
+    fn emit_const_default(&self) -> TokenStream {
+        let default = format_ident!("{}", self.entries[0].name);
+        quote!(pub const DEFAULT: Self = Self::#default;)
     }
 
     fn emit_rust(&self) -> TokenStream {
         let defs = self.emit_defs();
-        let default = format_ident!("{}", self.entries[0].name);
         let enum_name = self.emit_name();
+        let const_default = self.emit_const_default();
 
         #[cfg(feature = "emit-description")]
         let description = if let Some(description) = self.description.as_ref() {
-            let desc = format!("{description}");
+            let desc = format!("{}", description);
             quote!(#[doc = #desc])
         } else {
             quote!()
@@ -450,19 +389,23 @@ impl MavEnum {
             };
         }
 
-        dbg!(quote! {
+        quote! {
             #enum_def
+
+            impl #enum_name {
+                #const_default
+            }
 
             impl Default for #enum_name {
                 fn default() -> Self {
-                    Self::#default
+                    Self::DEFAULT
                 }
             }
-        })
+        }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MavEnumEntry {
     pub value: Option<u32>,
@@ -471,7 +414,7 @@ pub struct MavEnumEntry {
     pub params: Option<Vec<String>>,
 }
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MavMessage {
     pub id: u32,
@@ -484,7 +427,12 @@ impl MavMessage {
     /// Return Token of "MESSAGE_NAME_DATA
     /// for mavlink struct data
     fn emit_struct_name(&self) -> TokenStream {
-        let name = format_ident!("{}", format!("{}_DATA", self.name));
+        let name = format_ident!("{}_DATA", self.name);
+        quote!(#name)
+    }
+
+    fn emit_struct_meta_name(&self) -> TokenStream {
+        let name = format_ident!("{}_DATA_META", self.name);
         quote!(#name)
     }
 
@@ -512,9 +460,16 @@ impl MavMessage {
                     quote!()
                 };
 
+                let serde_with_attr = if matches!(field.mavtype, MavType::Array(_, _)) {
+                    quote!(#[cfg_attr(feature = "serde", serde(with = "serde_arrays"))])
+                } else {
+                    quote!()
+                };
+
                 quote! {
                     #description
                     #serde_default
+                    #serde_with_attr
                     #nametype
                 }
             })
@@ -529,7 +484,7 @@ impl MavMessage {
         let desc = format!("id: {}", self.id);
         ts.extend(quote!(#[doc = #desc]));
         if let Some(val) = self.description.clone() {
-            let doc = &format!("{val}.");
+            let doc = &format!("{}.", val);
             ts.extend(quote!(#[doc = #doc]));
         }
         ts
@@ -538,13 +493,15 @@ impl MavMessage {
     fn emit_serialize_vars(&self) -> TokenStream {
         let ser_vars = self.fields.iter().map(|f| f.rust_writer());
         quote! {
-            let mut _tmp = BytesMut::new(bytes);
+            let bytes_len = bytes.len();
+            let mut buf = &mut *bytes;
             #(#ser_vars)*
+            // `buf.len()` is the size of the unwritten part of the buffer
+            let written_len = bytes_len - buf.len();
             if matches!(version, MavlinkVersion::V2) {
-                let len = _tmp.len();
-                crate::remove_trailing_zeroes(&mut bytes[..len])
+                crate::remove_trailing_zeroes(&mut bytes[..written_len])
             } else {
-                _tmp.len()
+                written_len
             }
         }
     }
@@ -565,14 +522,13 @@ impl MavMessage {
             quote! {
                 let avail_len = _input.len();
 
-                let mut payload_buf  = [0; Self::ENCODED_LEN];
+                let mut payload_buf = [0; Self::ENCODED_LEN];
                 let mut buf = if avail_len < Self::ENCODED_LEN {
-                    //copy available bytes into an oversized buffer filled with zeros
+                    // copy available bytes into an oversized buffer filled with zeros
                     payload_buf[0..avail_len].copy_from_slice(_input);
-                    Bytes::new(&payload_buf)
+                    &payload_buf
                 } else {
-                    // fast zero copy
-                    Bytes::new(_input)
+                    _input
                 };
 
                 let mut _struct = Self::default();
@@ -582,12 +538,52 @@ impl MavMessage {
         }
     }
 
+    fn emit_default_impl(&self) -> TokenStream {
+        let msg_name = self.emit_struct_name();
+        quote! {
+            impl Default for #msg_name {
+                fn default() -> Self {
+                    Self::DEFAULT.clone()
+                }
+            }
+        }
+    }
+
+    fn emit_const_default(&self) -> TokenStream {
+        let initializers = self.fields.iter()
+            .map(|field| field.emit_default_initializer())
+            .collect::<TokenStream>();
+        quote!(pub const DEFAULT: Self = Self { #initializers };)
+    }
+
+    fn emit_meta(&self) -> TokenStream {
+        let name = self.name.as_str();
+        let msg_name = self.emit_struct_name();
+        let static_name = self.emit_struct_meta_name();
+        let id = self.id;
+        let extra_crc = extra_crc(self);
+        let variant = format_ident!("{name}");
+        quote! {
+            pub static #static_name: MessageMeta<MavMessage> = MessageMeta {
+                id: #id,
+                name: #name,
+                extra_crc: #extra_crc,
+                serialized_len: #msg_name::ENCODED_LEN as u8,
+                default: MavMessage::#variant(#msg_name::DEFAULT),
+            };
+        }
+    }
+
     fn emit_rust(&self) -> TokenStream {
         let msg_name = self.emit_struct_name();
         let (name_types, msg_encoded_len) = self.emit_name_types();
 
         let deser_vars = self.emit_deserialize_vars();
         let serialize_vars = self.emit_serialize_vars();
+        let const_default = self.emit_const_default();
+        let default_impl = self.emit_default_impl();
+        let meta_name = self.emit_struct_meta_name();
+        let meta = self.emit_meta();
 
         #[cfg(feature = "emit-description")]
         let description = self.emit_description();
@@ -597,28 +593,39 @@ impl MavMessage {
 
         quote! {
             #description
-            #[derive(Debug, Clone, PartialEq, Default)]
+            #[derive(Debug, Clone, PartialEq)]
             #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
             pub struct #msg_name {
                 #(#name_types)*
             }
 
+            #meta
+
             impl #msg_name {
                 pub const ENCODED_LEN: usize = #msg_encoded_len;
+                #const_default
+            }
 
-                pub fn deser(_version: MavlinkVersion, _input: &[u8]) -> Result<Self, ParserError> {
-                    #deser_vars
+            impl MessageInstance<MavMessage> for #msg_name {
+                fn meta() -> &'static MessageMeta<MavMessage> {
+                    &#meta_name
                 }
 
-                pub fn ser(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize {
+                fn serialize_payload(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize {
                     #serialize_vars
                 }
+
+                fn deserialize_payload(_version: MavlinkVersion, _input: &[u8]) -> Result<Self, ParserError> {
+                    #deser_vars
+                }
             }
+
+            #default_impl
         }
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MavField {
     pub mavtype: MavType,
@@ -657,7 +664,7 @@ impl MavField {
     fn emit_description(&self) -> TokenStream {
         let mut ts = TokenStream::new();
         if let Some(val) = self.description.clone() {
-            let desc = format!("{val}.");
+            let desc = format!("{}.", val);
             ts.extend(quote!(#[doc = #desc]));
         }
         ts
@@ -692,7 +699,7 @@ impl MavField {
         }
         let ts = TokenStream::from_str(&name).unwrap();
         let name = quote!(#ts);
-        let buf = format_ident!("_tmp");
+        let buf = format_ident!("buf");
         self.mavtype.rust_writer(&name, buf)
     }
 
@@ -731,6 +738,21 @@ impl MavField {
             }
         } else {
             self.mavtype.rust_reader(&name, buf)
+        }
+    }
+
+    fn emit_default_initializer(&self) -> TokenStream {
+        let field = self.emit_name();
+        // FIXME: Is this actually expected behaviour??
+        if matches!(self.mavtype, MavType::Array(_, _)) {
+            let default_value = self.mavtype.emit_default_value();
+            quote!(#field: #default_value,)
+        } else if let Some(ref enumname) = self.enumtype {
+            let ty = TokenStream::from_str(enumname).unwrap();
+            quote!(#field: #ty::DEFAULT,)
+        } else {
+            let default_value = self.mavtype.emit_default_value();
+            quote!(#field: #default_value,)
         }
     }
 }
@@ -806,23 +828,11 @@ impl MavType {
             Float => quote! {#val = #buf.get_f32_le();},
             Double => quote! {#val = #buf.get_f64_le();},
             Array(t, size) => {
-                if size > 32 {
-                    // it is a vector
-                    let r = t.rust_reader(&quote!(let val), buf);
-                    quote! {
-                        for _ in 0..#size {
-                            #r
-                            #val.push(val).unwrap();
-                        }
-                    }
-                } else {
-                    // handle as a slice
-                    let r = t.rust_reader(&quote!(let val), buf);
-                    quote! {
-                        for idx in 0..#size {
-                            #r
-                            #val[idx] = val;
-                        }
+                let r = t.rust_reader(&quote!(let val), buf);
+                quote! {
+                    for idx in 0..#size {
+                        #r
+                        #val[idx] = val;
                     }
                 }
             }
@@ -904,7 +914,8 @@ impl MavType {
     /// Used for generating struct fields.
     pub fn rust_type(&self) -> String {
         use self::MavType::*;
-        match self.clone() {
+
+        match self {
             UInt8 | UInt8MavlinkVersion => "u8".into(),
             Int8 => "i8".into(),
             Char => "u8".into(),
@@ -916,16 +927,29 @@ impl MavType {
             UInt64 => "u64".into(),
             Int64 => "i64".into(),
             Double => "f64".into(),
-            Array(t, size) => {
-                // format!("[{};{}]", t.rust_type(), size)
-                if size > 32 {
-                    // we have to use a vector to make our lives easier
-                    format!("Vec<{}, {}>", t.rust_type(), size)
-                } else {
-                    // we can use a slice, as Rust derives lot of things for slices <= 32 elements
-                    format!("[{};{}]", t.rust_type(), size)
-                }
-            }
+            Array(t, size) => format!("[{};{}]", t.rust_type(), size),
+        }
+    }
+
+    pub fn emit_default_value(&self) -> TokenStream {
+        use self::MavType::*;
+
+        match self {
+            UInt8 | UInt8MavlinkVersion => quote!(0_u8),
+            Int8 => quote!(0_i8),
+            Char => quote!(0_u8),
+            UInt16 => quote!(0_u16),
+            Int16 => quote!(0_i16),
+            UInt32 => quote!(0_u32),
+            Int32 => quote!(0_i32),
+            Float => quote!(0.0_f32),
+            UInt64 => quote!(0_u64),
+            Int64 => quote!(0_i64),
+            Double => quote!(0.0_f64),
+            Array(ty, size) => {
+                let default_value = ty.emit_default_value();
+                quote!([#default_value; #size])
+            },
         }
     }
 
@@ -1090,17 +1114,21 @@ pub fn parse_profile(
                     let attr = attr.unwrap();
                     match stack.last() {
                         Some(&MavXmlElement::Enum) => {
-                            if let b"name" = attr.key.into_inner() {
-                                mavenum.name = attr
-                                    .value
-                                    .clone()
-                                    .split(|b| *b == b'_')
-                                    .map(|x| x.to_ascii_lowercase())
-                                    .map(|mut v| {
-                                        v[0] = v[0].to_ascii_uppercase();
-                                        String::from_utf8(v).unwrap()
-                                    })
-                                    .collect();
+                            match attr.key.into_inner() {
+                                b"name" => {
+                                    mavenum.name = attr
+                                        .value
+                                        .clone()
+                                        .split(|b| *b == b'_')
+                                        .map(|x| x.to_ascii_lowercase())
+                                        .map(|mut v| {
+                                            v[0] = v[0].to_ascii_uppercase();
+                                            String::from_utf8(v).unwrap()
+                                        })
+                                        .collect();
+                                }
+                                b"bitmask" => mavenum.is_bitmask = true,
+                                _ => (),
                                 //mavenum.name = attr.value.clone();
                             }
                         }
@@ -1256,13 +1284,13 @@ pub fn parse_profile(
                         include = s.replace('\n', "");
                     }
                     (Some(&Version), Some(&Mavlink)) => {
-                        eprintln!("TODO: version {s:?}");
+                        eprintln!("TODO: version {:?}", s);
                     }
                     (Some(&Dialect), Some(&Mavlink)) => {
-                        eprintln!("TODO: dialect {s:?}");
+                        eprintln!("TODO: dialect {:?}", s);
                     }
                     (Some(Deprecated), _) => {
-                        eprintln!("TODO: deprecated {s:?}");
+                        eprintln!("TODO: deprecated {:?}", s);
                     }
                     data => {
                         panic!("unexpected text data {:?} reading {:?}", data, s);
@@ -1317,7 +1345,7 @@ pub fn parse_profile(
                 // println!("{}-{}", indent(depth), name);
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                eprintln!("Error: {}", e);
                 break;
             }
             _ => {}
@@ -1325,7 +1353,8 @@ pub fn parse_profile(
     }
 
     //let profile = profile.update_messages(); //TODO verify no longer needed
-    profile.update_enums()
+    profile.update_enums();
+    profile
 }
 
 /// Generate protobuf represenation of mavlink message set
@@ -1336,7 +1365,7 @@ pub fn generate<W: Write>(definitions_dir: &Path, definition_file: &String, outp
 
     // rust file
     let rust_tokens = profile.emit_rust();
-    writeln!(output_rust, "{rust_tokens}").unwrap();
+    writeln!(output_rust, "{}", rust_tokens).unwrap();
 }
 
 /// CRC operates over names of the message and names of its fields
