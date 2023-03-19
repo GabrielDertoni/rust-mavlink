@@ -77,10 +77,7 @@ mod test_v1_encode_decode {
         let (_header, recv_msg): (mavlink::MavHeader, mavlink::common::MavMessage) =
             mavlink::read_v2_msg(&mut c).expect("Failed to read");
 
-        assert_eq!(
-            mavlink::common::MavMessage::extra_crc(recv_msg.message_id()),
-            222_u8
-        );
+        assert_eq!(recv_msg.meta().extra_crc, 222_u8);
 
         if let mavlink::common::MavMessage::SERVO_OUTPUT_RAW(recv_msg) = recv_msg {
             assert_eq!(recv_msg.port, 123_u8);

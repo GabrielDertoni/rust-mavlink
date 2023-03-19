@@ -19,7 +19,7 @@ mod test_encode_decode {
         let mut c = v.as_slice();
         let (_header, recv_msg): (mavlink::MavHeader, common::MavMessage) =
             mavlink::read_v2_msg(&mut c).expect("Failed to read");
-        assert_eq!(recv_msg.message_id(), 0);
+        assert_eq!(recv_msg.meta().id, 0);
     }
 
     #[test]
@@ -91,7 +91,7 @@ mod test_encode_decode {
 
         match &recv_msg {
             ardupilotmega::MavMessage::HEARTBEAT(_data) => {
-                assert_eq!(recv_msg.message_id(), 0);
+                assert_eq!(recv_msg.meta().id, 0);
             }
             _ => panic!("Decoded wrong message type"),
         }
