@@ -372,7 +372,9 @@ impl MAVLinkV1MessageRaw {
         let payload_length: usize = self.payload_length().into();
         let mut crc_calculator = CRCu16::crc16mcrf4cc();
         crc_calculator.digest(&self.0[1..(1 + Self::HEADER_SIZE + payload_length)]);
-        let extra_crc = M::meta_from_id(self.message_id() as u32).unwrap().extra_crc;
+        let extra_crc = M::meta_from_id(self.message_id() as u32)
+            .map(|meta| meta.extra_crc)
+            .unwrap_or(0);
 
         crc_calculator.digest(&[extra_crc]);
         crc_calculator.get_crc()
@@ -554,7 +556,9 @@ impl MAVLinkV2MessageRaw {
         let mut crc_calculator = CRCu16::crc16mcrf4cc();
         crc_calculator.digest(&self.0[1..(1 + Self::HEADER_SIZE + payload_length)]);
 
-        let extra_crc = M::meta_from_id(self.message_id()).unwrap().extra_crc;
+        let extra_crc = M::meta_from_id(self.message_id())
+            .map(|meta| meta.extra_crc)
+            .unwrap_or(0);
         crc_calculator.digest(&[extra_crc]);
         crc_calculator.get_crc()
     }
