@@ -299,7 +299,7 @@ impl MavEnum {
     }
 
     fn emit_defs(&self) -> Vec<TokenStream> {
-        let mut cnt = 0isize;
+        let mut cnt = 0u32;
         self.entries
             .iter()
             .map(|enum_entry| {
@@ -321,9 +321,13 @@ impl MavEnum {
                     value = quote!(#cnt);
                 } else {
                     let tmp_value = enum_entry.value.unwrap();
-                    cnt = cnt.max(tmp_value as isize);
-                    let tmp = TokenStream::from_str(&tmp_value.to_string()).unwrap();
-                    value = quote!(#tmp);
+                    cnt = cnt.max(tmp_value);
+                    if self.bitfield.is_some() {
+                        let tmp = TokenStream::from_str(&tmp_value.to_string()).unwrap();
+                        value = quote!(#tmp);
+                    } else {
+                        value = quote!(#tmp_value);
+                    }
                 };
                 if self.bitfield.is_some() {
                     quote! {
@@ -382,6 +386,7 @@ impl MavEnum {
                 #[derive(Debug, Copy, Clone, PartialEq, FromPrimitive, ToPrimitive)]
                 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
                 #[cfg_attr(feature = "serde", serde(tag = "type"))]
+                #[repr(u32)]
                 #description
                 pub enum #enum_name {
                     #(#defs)*
