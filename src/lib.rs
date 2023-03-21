@@ -58,96 +58,26 @@ mod embedded;
 #[cfg(feature = "embedded")]
 use embedded::{Read, Write};
 
-/*
-pub struct BytesMut<B> {
-    buf: B,
-}
-
-impl<B: BufMut> BytesMut<B> {
-    fn new(buf: B) -> Self {
-        Bytesn { buf }
-    }
-
-    fn reserve_slice<'a>(&'a mut self, n: usize) -> Option<InitSlice<'a, B>> {
-        use std::{ptr, slice};
-
-        unsafe {
-            // SAFETY: We are not reading or writing uninitialized bytes
-            let uninit = self.buf.chunk_mut().as_mut_ptr();
-            ptr::write_bytes(uninit, 0, n);
-        }
-    }
-}
-
-pub struct InitSlice<'a, B: BufMut> {
-    bytes_mut: &'a mut BytesMut<B>,
-    n: usize,
-}
-
-impl<'a, B: BufMut> Deref for InitSlice<'a, B> {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        unsafe {
-            // SAFETY: 
-            let uninit = self.bytes_mut.buf.chunk_mut().as_mut_ptr() as *const _;
-            slice::from_raw_parts::<'a, u8>(uninit as *const u8, n)
-        }
-    }
-}
-
-impl<'a, B: BufMut> DerefMut for InitSlice<'a, B> {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            let uninit = self.bytes_mut.buf.chunk_mut().as_mut_ptr();
-            slice::from_raw_parts::<'a, u8>(uninit as *mut u8, n)
-        }
-    }
-}
-
-impl<'a, B: BufMut> Drop for InitSlice<'a, B> {
-    fn drop(&mut self) {
-        let n = self.n;
-        unsafe { self.bytes_mut.buf.advance_mut(n); }
-    }
-}
-
-impl<B: BufMut> BufMut for BytesMut<B> {
-    fn remaining_mut(&self) -> usize {
-        self.buf.remaining_mut()
-    }
-
-    unsafe fn advance_mut(&mut self, cnt: usize) {
-        self.buf.advance_mut(cnt)
-    }
-
-    fn chunk_mut(&mut self) -> bytes::UnintSlice {
-        self.buf.chunk_mut()
-    }
-}
-*/
-
 pub const MAX_FRAME_SIZE: usize = 280;
 
-pub struct MessageMeta<M: Message> {
+pub struct MessageMeta {
     pub id: u32,
     pub name: &'static str,
     pub extra_crc: u8,
     pub serialized_len: u8,
-    pub default: M,
 }
 
-pub trait MessageInstance<M: Message>: Default {
-    fn meta() -> &'static MessageMeta<M>;
+pub trait MessageData: Default {
+    fn meta() -> &'static MessageMeta;
 
     fn serialize_payload(&self, version: MavlinkVersion, payload: &mut [u8]) -> usize;
     fn deserialize_payload(version: MavlinkVersion, payload: &[u8]) -> Result<Self, ParserError>;
 }
 
 pub trait Message: Sized + 'static {
-    fn meta(&self) -> &'static MessageMeta<Self>;
-    fn meta_from_id(id: u32) -> Option<&'static MessageMeta<Self>>;
-    fn meta_from_name(name: &str) -> Option<&'static MessageMeta<Self>>;
+    fn meta(&self) -> &'static MessageMeta;
+    fn meta_from_id(id: u32) -> Option<&'static MessageMeta>;
+    fn meta_from_name(name: &str) -> Option<&'static MessageMeta>;
 
     /// Serialize **Message** into byte slice and return count of bytes written
     fn serialize(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize;

@@ -148,7 +148,7 @@ impl MavProfile {
             #[allow(unused_imports)]
             use bytes::{Buf, BufMut};
 
-            use crate::{Message, MessageInstance, MavlinkVersion, MessageMeta, error::*};
+            use crate::{Message, MessageData, MavlinkVersion, MessageMeta, error::*};
 
             #[cfg(feature = "serde")]
             use serde::{Serialize, Deserialize};
@@ -197,7 +197,7 @@ impl MavProfile {
             });
 
         quote! {
-            fn meta(&self) -> &'static MessageMeta<Self> {
+            fn meta(&self) -> &'static MessageMeta {
                 use MavMessage::*;
 
                 match self {
@@ -233,7 +233,7 @@ impl MavProfile {
         ids: &[TokenStream],
     ) -> TokenStream {
         quote! {
-            fn meta_from_id(id: u32) -> Option<&'static MessageMeta<Self>> {
+            fn meta_from_id(id: u32) -> Option<&'static MessageMeta> {
                 match id {
                     #(#ids => Some(&#struct_meta_names),)*
                     _ => None,
@@ -250,7 +250,7 @@ impl MavProfile {
         let message_names_str = message_names.iter()
             .map(|name| name.to_string().into_token_stream());
         quote! {
-            fn meta_from_name(name: &str) -> Option<&'static MessageMeta<Self>> {
+            fn meta_from_name(name: &str) -> Option<&'static MessageMeta> {
                 match name {
                     #(#message_names_str => Some(&#struct_meta_names),)*
                     _ => None,
@@ -567,14 +567,12 @@ impl MavMessage {
         let static_name = self.emit_struct_meta_name();
         let id = self.id;
         let extra_crc = extra_crc(self);
-        let variant = format_ident!("{name}");
         quote! {
-            pub static #static_name: MessageMeta<MavMessage> = MessageMeta {
+            pub static #static_name: MessageMeta = MessageMeta {
                 id: #id,
                 name: #name,
                 extra_crc: #extra_crc,
                 serialized_len: #msg_name::ENCODED_LEN as u8,
-                default: MavMessage::#variant(#msg_name::DEFAULT),
             };
         }
     }
@@ -611,8 +609,8 @@ impl MavMessage {
                 #const_default
             }
 
-            impl MessageInstance<MavMessage> for #msg_name {
-                fn meta() -> &'static MessageMeta<MavMessage> {
+            impl MessageData for #msg_name {
+                fn meta() -> &'static MessageMeta {
                     &#meta_name
                 }
 
