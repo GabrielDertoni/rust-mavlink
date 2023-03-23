@@ -42,7 +42,8 @@ use utils::remove_trailing_zeroes;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use bytes::{Buf, BufMut};
+pub mod bytes;
+pub mod bytes_mut;
 
 use crate::error::ParserError;
 
@@ -78,6 +79,7 @@ pub trait Message: Sized + 'static {
     fn meta(&self) -> &'static MessageMeta;
     fn meta_from_id(id: u32) -> Option<&'static MessageMeta>;
     fn meta_from_name(name: &str) -> Option<&'static MessageMeta>;
+    fn meta_field<T, F: FnOnce(&'static MessageMeta) -> T>(&self, extract: F) -> T;
 
     /// Serialize **Message** into byte slice and return count of bytes written
     fn serialize(&self, version: MavlinkVersion, bytes: &mut [u8]) -> usize;
@@ -146,7 +148,7 @@ impl<M: Message> MavFrame<M> {
     //    }
 
     /// Serialize MavFrame into a vector, so it can be sent over a socket, for example.
-    pub fn serialize<B: BufMut>(&self, mut buf: B) -> Result<(), error::NotEnoughBytes> {
+    pub fn serialize(&self, mut buf: bytes_mut::BytesMut) -> Result<(), error::NotEnoughBytes> {
         let header_size = if self.protocol_version == MavlinkVersion::V1 {
             MAVLinkV1MessageRaw::HEADER_SIZE
         } else {
@@ -155,7 +157,7 @@ impl<M: Message> MavFrame<M> {
         let serialized_len = self.msg.meta().serialized_len;
         // Assumes no signature
         let msg_size = header_size + serialized_len as usize + 2;
-        if buf.remaining_mut() < msg_size {
+        if buf.remaining() < msg_size {
             return Err(error::NotEnoughBytes);
         }
 
@@ -168,7 +170,7 @@ impl<M: Message> MavFrame<M> {
         match self.protocol_version {
             MavlinkVersion::V2 => {
                 let bytes: [u8; 4] = self.msg.meta().id.to_le_bytes();
-                buf.put(&bytes[..3]);
+                buf.put_slice(&bytes[..3]);
             }
             MavlinkVersion::V1 => buf.put_u8(self.msg.meta().id as u8),
         }
@@ -177,13 +179,13 @@ impl<M: Message> MavFrame<M> {
         let payload_len = self.msg.serialize(self.protocol_version, &mut payload_buf);
         debug_assert_eq!(payload_len, serialized_len as usize);
 
-        buf.put(&payload_buf[..payload_len]);
+        buf.put_slice(&payload_buf[..payload_len]);
         Ok(())
     }
 
     /// Deserialize MavFrame from a slice that has been received from, for example, a socket.
     pub fn deserialize(version: MavlinkVersion, input: &[u8]) -> Result<Self, ParserError> {
-        let mut buf = input;
+        let mut buf = bytes::Bytes::new(input);
 
         let system_id = buf.get_u8();
         let component_id = buf.get_u8();
@@ -199,7 +201,7 @@ impl<M: Message> MavFrame<M> {
             MavlinkVersion::V1 => buf.get_u8().into(),
         };
 
-        match M::deserialize(version, msg_id, buf) {
+        match M::deserialize(version, msg_id, buf.remaining_bytes()) {
             Ok(msg) => Ok(Self {
                 header,
                 msg,

@@ -131,6 +131,7 @@ impl MavProfile {
 
         let mav_message = self.emit_mav_message(&variant_names, &struct_names);
         let fn_meta = self.emit_fn_meta(&variant_names, &struct_meta_names);
+        let fn_meta_field = self.emit_fn_meta_field(&variant_names, &struct_meta_names);
         let fn_meta_from_id = self.emit_fn_meta_from_id(&struct_meta_names, &msg_ids);
         let fn_meta_from_name = self.emit_fn_meta_from_name(&struct_meta_names, &variant_names);
         let mav_message_serialize = self.emit_mav_message_serialize(&variant_names);
@@ -145,10 +146,8 @@ impl MavProfile {
             use num_traits::{FromPrimitive, ToPrimitive};
             #[allow(unused_imports)]
             use bitflags::bitflags;
-            #[allow(unused_imports)]
-            use bytes::{Buf, BufMut};
 
-            use crate::{Message, MessageData, MavlinkVersion, MessageMeta, error::*};
+            use crate::{Message, MessageData, MavlinkVersion, MessageMeta, error::*, bytes::Bytes, bytes_mut::BytesMut};
 
             #[cfg(feature = "serde")]
             use serde::{Serialize, Deserialize};
@@ -162,6 +161,7 @@ impl MavProfile {
 
             impl Message for MavMessage {
                 #fn_meta
+                #fn_meta_field
                 #fn_meta_from_id
                 #fn_meta_from_name
                 #mav_message_serialize
@@ -198,6 +198,25 @@ impl MavProfile {
 
         quote! {
             fn meta(&self) -> &'static MessageMeta {
+                use MavMessage::*;
+
+                match self {
+                    #(#arms,)*
+                }
+            }
+        }
+    }
+
+    fn emit_fn_meta_field(&self, enum_variants: &[TokenStream], struct_meta_names: &[TokenStream]) -> TokenStream {
+        let arms = enum_variants
+            .iter()
+            .zip(struct_meta_names)
+            .map(|(variant, struct_meta_name)| {
+                quote!(#variant(_) => extract(&#struct_meta_name))
+            });
+
+        quote! {
+            fn meta_field<T, F: FnOnce(&'static MessageMeta) -> T>(&self, extract: F) -> T {
                 use MavMessage::*;
 
                 match self {
@@ -498,15 +517,13 @@ impl MavMessage {
     fn emit_serialize_vars(&self) -> TokenStream {
         let ser_vars = self.fields.iter().map(|f| f.rust_writer());
         quote! {
-            let bytes_len = bytes.len();
-            let mut buf = &mut *bytes;
+            let mut buf = BytesMut::new(bytes);
             #(#ser_vars)*
-            // `buf.len()` is the size of the unwritten part of the buffer
-            let written_len = bytes_len - buf.len();
             if matches!(version, MavlinkVersion::V2) {
-                crate::remove_trailing_zeroes(&mut bytes[..written_len])
+                let len = buf.len();
+                crate::remove_trailing_zeroes(&mut bytes[..len])
             } else {
-                written_len
+                buf.len()
             }
         }
     }
@@ -531,9 +548,9 @@ impl MavMessage {
                 let mut buf = if avail_len < Self::ENCODED_LEN {
                     // copy available bytes into an oversized buffer filled with zeros
                     payload_buf[0..avail_len].copy_from_slice(_input);
-                    &payload_buf
+                    Bytes::new(&payload_buf)
                 } else {
-                    _input
+                    Bytes::new(_input)
                 };
 
                 let mut _struct = Self::default();
