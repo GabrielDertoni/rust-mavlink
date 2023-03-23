@@ -155,11 +155,11 @@ impl MavProfile {
         let msg_ids = self.emit_msg_ids();
         let msg_crc = self.emit_msg_crc();
 
-        let mav_message = self.emit_mav_message(&enum_names, &struct_names);
+        let mav_message = self.emit_mav_message(&enum_names, &struct_names, &msg_ids);
         let mav_message_parse = self.emit_mav_message_parse(&enum_names, &struct_names, &msg_ids);
         let mav_message_crc = self.emit_mav_message_crc(&id_width, &msg_ids, &msg_crc);
         let mav_message_name = self.emit_mav_message_name(&enum_names);
-        let mav_message_id = self.emit_mav_message_id(&enum_names, &msg_ids);
+        let mav_message_id = self.emit_mav_message_id();
         let mav_message_id_from_name = self.emit_mav_message_id_from_name(&enum_names, &msg_ids);
         let mav_message_default_from_id =
             self.emit_mav_message_default_from_id(&enum_names, &msg_ids);
@@ -209,12 +209,14 @@ impl MavProfile {
         &self,
         enums: &Vec<TokenStream>,
         structs: &Vec<TokenStream>,
+        msg_ids: &Vec<TokenStream>,
     ) -> TokenStream {
         quote! {
             #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
             #[cfg_attr(feature = "serde", serde(tag = "type"))]
+            #[repr(u32)]
             pub enum MavMessage {
-                #(#enums(#structs),)*
+                #(#enums(#structs) = #msg_ids,)*
             }
         }
     }
@@ -272,13 +274,13 @@ impl MavProfile {
         }
     }
 
-    fn emit_mav_message_id(&self, enums: &Vec<TokenStream>, ids: &Vec<TokenStream>) -> TokenStream {
-        let id_width = format_ident!("u32");
+    fn emit_mav_message_id(&self) -> TokenStream {
         quote! {
-            fn message_id(&self) -> #id_width {
-                match self {
-                    #(Self::#enums(..) => #ids,)*
-                }
+            fn message_id(&self) -> u32 {
+                // SAFETY: Because `Self` is marked `repr(u32)`, its layout is a `repr(C)` `union`
+                // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+                // field, so we can read the discriminant without offsetting the pointer.
+                unsafe { *<*const _>::from(self).cast::<u32>() }
             }
         }
     }
